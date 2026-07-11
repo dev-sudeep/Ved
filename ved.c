@@ -1,5 +1,5 @@
 /* ============================================================================
- * ves.c  --  Visual EDitor
+ * ved.c  --  Visual EDitor
  * A single-file, dependency-light (libc + libutil) terminal IDE inspired by
  * Visual Studio Code: file explorer, tabbed editor with syntax highlighting,
  * integrated ANSI terminal (real PTY + shell), command palette, and DOS-Edit
