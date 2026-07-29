@@ -5,7 +5,7 @@
  * integrated ANSI terminal (real PTY + shell), command palette, and DOS-Edit
  * style modal dialogs. Dark/Light themes approximate VS Code Dark+/Light+.
  *
- * Build:   gcc -O2 -Wall -o ved ved.c -lutil
+ * Build:   gcc -O2 -Wall -o ved ved.c lsp.c -lutil
  * Run:     ./ved [file-or-directory]
  *
  * Keys:
@@ -112,12 +112,15 @@ enum PendingAction {
 
 /* =============================== data types =============================== */
 
+#include "lsp.h"
+
 typedef struct {
   int size, rsize;
   char *chars;
   char *render;
   unsigned char *hl;
   int hl_open_comment;
+  int diag_severity; /* 0=None, 1=Error, 2=Warning */
 } erow;
 
 typedef struct Syntax {
@@ -156,6 +159,7 @@ typedef struct {
   Syntax *syntax;
   UndoStack undo_stack;
   UndoStack redo_stack;
+  LspClient lsp;
 } EBuffer;
 
 typedef struct DirNode {
@@ -256,6 +260,17 @@ typedef struct {
   int explorer_x, explorer_y, explorer_h;
   int editor_x, editor_y, editor_w, editor_h;
   int term_x, term_y, term_w, term_h;
+  int diag_panel_y, diag_panel_actual_h; /* diagnostics panel geometry */
+
+  /* diagnostics panel configuration */
+  int show_diag_panel; /* 1 = visible */
+  int diag_panel_h;    /* desired height in rows (default 6) */
+  int diag_scroll;     /* scroll offset into the diagnostics list */
+
+  /* resizable panes drag state */
+  int drag_type;       /* 0=none, 1=explorer_w, 2=terminal_h, 3=diag_panel_h */
+  int drag_start_val;  /* value of dimension at drag start (for reference) */
+  int explorer_user_w; /* 0=auto, >0=user-overridden explorer width */
 } State;
 
 static State S;
@@ -280,6 +295,10 @@ static void explorerRebuildFlat(void);
 static void termWrite(const char *buf, size_t n);
 static void executeCommand(const char *cmd);
 static void closeTab(int idx);
+static void lspStartForBuffer(EBuffer *b);
+static void lspNotifyChange(EBuffer *b);
+static void applyDiagnosticsToRows(EBuffer *b);
+static void computeLayout(void);
 
 /* ============================ theme color tables ========================= */
 typedef struct {
@@ -425,8 +444,8 @@ static void abGoto(abuf *ab, int row, int col) {
 static void disableRawMode(void) {
   if (S.raw_enabled) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &S.orig_termios);
-    /* disable mouse tracking, restore cursor, main screen buffer */
-    printf("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+    /* disable mouse tracking (incl. button motion), restore cursor, main screen buffer */
+    printf("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l");
     fflush(stdout);
     S.raw_enabled = 0;
   }
@@ -451,8 +470,8 @@ static void enableRawMode(void) {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
     dieMsg("tcsetattr");
   S.raw_enabled = 1;
-  /* alternate screen buffer, hide cursor, enable SGR mouse mode */
-  printf("\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+  /* alternate screen buffer, hide cursor, enable SGR mouse + button-motion tracking */
+  printf("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h");
   fflush(stdout);
 }
 
@@ -837,6 +856,7 @@ static BufferSnapshot createBufferSnapshot(EBuffer *b) {
       dst->hl = NULL;
     }
     dst->hl_open_comment = src->hl_open_comment;
+    dst->diag_severity = src->diag_severity;
   }
   return snap;
 }
@@ -976,6 +996,7 @@ static void bufferInsertRow(EBuffer *b, int at, const char *s, size_t len) {
   b->row[at].rsize = 0;
   b->row[at].hl = NULL;
   b->row[at].hl_open_comment = 0;
+  b->row[at].diag_severity = 0;
   b->numrows++;
   updateRender(&b->row[at]);
 }
@@ -1035,6 +1056,7 @@ static void editorInsertChar(EBuffer *b, int c) {
   bufMarkDirty(b);
   updateSyntaxAll(b);
   b->target_rx = rowCxToRx(&b->row[b->cy], b->cx);
+  lspNotifyChange(b);
 }
 
 static void editorInsertNewline(EBuffer *b) {
@@ -1081,6 +1103,7 @@ static void editorInsertNewline(EBuffer *b) {
   bufMarkDirty(b);
   updateSyntaxAll(b);
   b->target_rx = rowCxToRx(&b->row[b->cy], b->cx);
+  lspNotifyChange(b);
 }
 
 static void editorDelChar(EBuffer *b) {
@@ -1106,6 +1129,7 @@ static void editorDelChar(EBuffer *b) {
   bufMarkDirty(b);
   updateSyntaxAll(b);
   b->target_rx = rowCxToRx(&b->row[b->cy], b->cx);
+  lspNotifyChange(b);
 }
 
 static void editorDelForward(EBuffer *b) {
@@ -1127,6 +1151,7 @@ static void editorDelForward(EBuffer *b) {
   bufMarkDirty(b);
   updateSyntaxAll(b);
   b->target_rx = rowCxToRx(&b->row[b->cy], b->cx);
+  lspNotifyChange(b);
 }
 
 /* ======================== new editor operations ========================= */
@@ -1203,6 +1228,7 @@ static void editorToggleLineComment(EBuffer *b) {
   }
   bufMarkDirty(b);
   updateSyntaxAll(b);
+  lspNotifyChange(b);
 }
 
 /* Find 'query' (case-insensitive) in buffer starting from (start_row, start_col).
@@ -1291,12 +1317,16 @@ static void bufferFreeAll(EBuffer *b) {
   free(b->filename);
   clearUndoStack(&b->undo_stack);
   clearUndoStack(&b->redo_stack);
+  lsp_free(&b->lsp);
   memset(b, 0, sizeof(*b));
 }
 
 /* Initialize a fresh empty buffer struct (does not allocate a tab slot). */
 static void bufferInit(EBuffer *b, const char *filename) {
   memset(b, 0, sizeof(*b));
+  /* LSP fds MUST be -1 (not 0) or the main loop polls stdin as an LSP fd */
+  b->lsp.fd_in = b->lsp.fd_out = -1;
+  b->lsp.pid   = -1;
   b->filename = filename ? xstrdup(filename) : NULL;
   b->syntax = syntaxForFilename(filename);
   bufferInsertRow(b, 0, "", 0);
@@ -1340,6 +1370,7 @@ static void loadFileIntoBuffer(EBuffer *b, const char *filename) {
   b->filename = xstrdup(filename);
   b->syntax = syntaxForFilename(filename);
   updateSyntaxAll(b);
+  lspStartForBuffer(b);
 }
 
 /* Opens filename in a new tab, or focuses an already-open tab for that file. */
@@ -2320,6 +2351,10 @@ static void dialogConfirm(int buttonIdx) {
         return;
       }
       editorSaveAs(b, b->filename);
+    } else {
+      /* User selected "Don't Save": clear dirty flag for this tab */
+      if (d.ctx_int >= 0 && d.ctx_int < S.ntabs)
+        S.tabs[d.ctx_int].dirty = 0;
     }
     for (int i = 0; i < S.ntabs; i++) {
       if (S.tabs[i].dirty) {
@@ -2456,6 +2491,7 @@ static Command COMMANDS[] = {
     {"Duplicate Line", "Ctrl+D"},
     {"Delete Line", "Ctrl+K"},
     {"Comment/Uncomment", "Ctrl+/"},
+    {"Toggle Problems Panel", "Ctrl+L"},
     {"Quit", "Ctrl+Q"},
     {"Help", ""},
 };
@@ -2584,6 +2620,10 @@ static void executeCommand(const char *cmd) {
       editorToggleLineComment(b);
   } else if (!strcmp(cmd, "Quit")) {
     requestQuit();
+  } else if (!strcmp(cmd, "Toggle Problems Panel")) {
+    S.show_diag_panel = !S.show_diag_panel;
+    S.diag_scroll = 0;
+    computeLayout();
   } else if (!strcmp(cmd, "Help")) {
     openMessageDialog(
         "ved Help",
@@ -2591,7 +2631,7 @@ static void executeCommand(const char *cmd) {
         "Ctrl+S save        Ctrl+N new file    Ctrl+W close tab\n"
         "Ctrl+G go to line  Ctrl+F find        Ctrl+H find+replace\n"
         "Ctrl+D dup line    Ctrl+K del line    Ctrl+/ comment\n"
-        "Ctrl+\\ cycle focus                   Ctrl+Q quit\n"
+        "Ctrl+L problems    Ctrl+\\ cycle focus  Ctrl+Q quit\n"
         "Click files/folders in the explorer to open/expand.");
   }
 }
@@ -2622,19 +2662,37 @@ static void computeLayout(void) {
   S.explorer_x = 0;
   S.explorer_y = contentTop;
   S.explorer_h = mainBot - contentTop;
-  S.explorer_width =
-      S.show_explorer ? (S.screencols / 5 < EXPLORER_MIN_W ? EXPLORER_MIN_W
-                                                           : S.screencols / 5)
-                      : 0;
-  if (S.explorer_width > S.screencols - 20)
-    S.explorer_width = S.screencols - 20;
-  if (S.explorer_width < 0)
+  if (S.show_explorer) {
+    if (S.explorer_user_w > 0) {
+      S.explorer_width = S.explorer_user_w;
+    } else {
+      S.explorer_width = (S.screencols / 5 < EXPLORER_MIN_W ? EXPLORER_MIN_W
+                                                             : S.screencols / 5);
+    }
+    if (S.explorer_width < EXPLORER_MIN_W) S.explorer_width = EXPLORER_MIN_W;
+    if (S.explorer_width > S.screencols - 20) S.explorer_width = S.screencols - 20;
+    if (S.explorer_width < 0) S.explorer_width = 0;
+  } else {
     S.explorer_width = 0;
+  }
 
   S.editor_x = S.show_explorer ? S.explorer_width + 1 : 0;
   S.editor_y = contentTop;
   S.editor_w = S.screencols - S.editor_x;
   S.editor_h = mainBot - contentTop;
+
+  /* Diagnostics panel: carve space out of the bottom of the editor area */
+  S.diag_panel_actual_h = 0;
+  S.diag_panel_y        = S.editor_y + S.editor_h; /* off-screen by default */
+  if (S.show_diag_panel && S.editor_h > 6) {
+    int ph = S.diag_panel_h < 2 ? 2 : S.diag_panel_h;
+    int maxph = S.editor_h / 3; /* never more than a third of editor */
+    if (maxph < 2) maxph = 2;
+    if (ph > maxph) ph = maxph;
+    S.diag_panel_actual_h = ph;
+    S.diag_panel_y        = S.editor_y + S.editor_h - ph;
+    S.editor_h           -= ph;
+  }
 
   if (S.term_h > 0)
     termResize(&S.term, S.term_h > 2 ? S.term_h - 2 : 1, S.term_w - 2);
@@ -2728,9 +2786,15 @@ static void drawExplorer(abuf *ab) {
       }
     }
     abReset(ab);
-    abBg(ab, border);
-    abFg(ab, border);
-    abAppendStr(ab, "\xe2\x94\x82"); /* │ */
+    /* Resize handle border: accent color when active drag, else slightly highlighted */
+    if (S.drag_type == 1) {
+      abBg(ab, THEME_ACCENT[S.theme]);
+      abFg(ab, THEME_TOPBAR_BG[S.theme]);
+    } else {
+      abBg(ab, border);
+      abFg(ab, THEME_ACCENT[S.theme]); /* slightly highlighted to hint draggability */
+    }
+    abAppendStr(ab, "\xe2\x94\x83"); /* ┃ thick vertical bar — drag handle */
     abReset(ab);
   }
 }
@@ -2846,7 +2910,7 @@ static void drawEditorArea(abuf *ab) {
   }
 
   EBuffer *b = curBuf();
-  int gutterW = 5;
+  int gutterW = 6;
   int viewCols = S.editor_w - gutterW;
   if (viewCols < 1)
     viewCols = 1;
@@ -2857,12 +2921,22 @@ static void drawEditorArea(abuf *ab) {
     abGoto(ab, contentY + r, S.editor_x);
     abBg(ab, bg);
     if (filerow < b->numrows) {
+      erow *row = &b->row[filerow];
+      if (row->diag_severity == 1) {
+        abFg(ab, (RGB){255, 0, 0});
+        abAppendStr(ab, ">");
+      } else if (row->diag_severity == 2) {
+        abFg(ab, (RGB){255, 255, 0});
+        abAppendStr(ab, ">");
+      } else {
+        abAppendStr(ab, " ");
+      }
       abFg(ab, filerow == b->cy ? THEME_LINE_NUM_ACTIVE[S.theme]
                                 : THEME_LINE_NUM[S.theme]);
       abAppendFmt(ab, "%4d ", filerow + 1);
     } else {
       abFg(ab, THEME_LINE_NUM[S.theme]);
-      abAppendStr(ab, "     ");
+      abAppendStr(ab, "      ");
     }
     if (filerow < b->numrows) {
       erow *row = &b->row[filerow];
@@ -2894,19 +2968,72 @@ static void drawEditorArea(abuf *ab) {
     abReset(ab);
   }
 
-  /* status line */
+  /* ---- status line ---- */
   abGoto(ab, contentY + contentH, S.editor_x);
   abBg(ab, THEME_STATUSBAR_BG[S.theme]);
   abFg(ab, THEME_STATUSBAR_FG[S.theme]);
-  char left[256], right[128];
+
+  char left[256];
   snprintf(left, sizeof(left), " %s%s  %s ",
            b->filename ? b->filename : "Untitled", b->dirty ? " *" : "",
            b->syntax ? b->syntax->name : "Plain Text");
-  snprintf(right, sizeof(right), "Ln %d, Col %d ", b->cy + 1, b->cx + 1);
-  int ll = (int)strlen(left), rl = (int)strlen(right);
+  int ll = (int)strlen(left);
   abAppendStr(ab, left);
-  for (int i = ll; i < S.editor_w - rl; i++)
-    abAppendStr(ab, " ");
+
+  /* LSP status indicator (drawn in color between left and right) */
+  int lsp_mid_len = 0;
+  if (b->syntax) {
+    const char *lcmd = lsp_cmd_for_syntax(b->syntax->name);
+    if (!lcmd) {
+      /* No server registered for this language — warn the user */
+      abFg(ab, (RGB){255, 180, 50});
+      abAppendStr(ab, " [no LSP] ");
+      lsp_mid_len = 10;
+    } else if (!b->lsp.initialized || b->lsp.fd_out < 0) {
+      /* Server command exists but not yet connected */
+      char sname[32] = ""; int k = 0;
+      for (int i = 0; lcmd[i] && lcmd[i] != ' ' && k < 31; i++)
+        sname[k++] = lcmd[i];
+      sname[k] = '\0';
+      abFg(ab, (RGB){160, 160, 160});
+      char ind[48]; snprintf(ind, sizeof(ind), " %s... ", sname);
+      abAppendStr(ab, ind);
+      lsp_mid_len = (int)strlen(ind);
+    } else {
+      /* Connected — show server name and diagnostic counts */
+      char sname[32] = ""; int k = 0;
+      const char *sc = b->lsp.server_cmd ? b->lsp.server_cmd : lcmd;
+      for (int i = 0; sc[i] && sc[i] != ' ' && k < 31; i++)
+        sname[k++] = sc[i];
+      sname[k] = '\0';
+      if (b->lsp.diag_error_count) {
+        abFg(ab, (RGB){255, 90, 90});
+        char ec[24]; snprintf(ec, sizeof(ec), " x%d", b->lsp.diag_error_count);
+        abAppendStr(ab, ec); lsp_mid_len += (int)strlen(ec);
+      }
+      if (b->lsp.diag_warning_count) {
+        abFg(ab, (RGB){255, 210, 60});
+        char wc[24]; snprintf(wc, sizeof(wc), " !%d", b->lsp.diag_warning_count);
+        abAppendStr(ab, wc); lsp_mid_len += (int)strlen(wc);
+      }
+      if (!b->lsp.diag_error_count && !b->lsp.diag_warning_count) {
+        abFg(ab, (RGB){80, 210, 80});
+        char ok[48]; snprintf(ok, sizeof(ok), " %s OK", sname);
+        abAppendStr(ab, ok); lsp_mid_len += (int)strlen(ok);
+      } else {
+        abFg(ab, (RGB){170, 170, 170});
+        char sv[36]; snprintf(sv, sizeof(sv), " %s", sname);
+        abAppendStr(ab, sv); lsp_mid_len += (int)strlen(sv);
+      }
+    }
+  }
+  abFg(ab, THEME_STATUSBAR_FG[S.theme]);
+
+  char right[64];
+  snprintf(right, sizeof(right), " Ln %d, Col %d ", b->cy + 1, b->cx + 1);
+  int rl = (int)strlen(right);
+  int pad = S.editor_w - ll - lsp_mid_len - rl;
+  for (int i = 0; i < pad; i++) abAppendStr(ab, " ");
   abAppendStr(ab, right);
   abReset(ab);
 }
@@ -2918,8 +3045,13 @@ static void drawTerminalPane(abuf *ab) {
   RGB bg = THEME_BG[S.theme];
 
   abGoto(ab, S.term_y, 0);
-  abBg(ab, border);
-  abFg(ab, THEME_EDITOR_FG[S.theme]);
+  if (S.drag_type == 2) {
+    abBg(ab, THEME_ACCENT[S.theme]);
+    abFg(ab, THEME_TOPBAR_BG[S.theme]);
+  } else {
+    abBg(ab, border);
+    abFg(ab, THEME_EDITOR_FG[S.theme]);
+  }
   char hdr[64];
   snprintf(hdr, sizeof(hdr), " TERMINAL%s ",
            S.focus == FOCUS_TERMINAL ? " *" : "");
@@ -3177,6 +3309,167 @@ static void drawPaletteDropdown(abuf *ab) {
   }
 }
 
+/* ================================================================
+ * LSP integration helpers
+ * ================================================================ */
+
+/** Clear all per-row diagnostic markers, then re-apply from b->lsp.diagnostics. */
+static void applyDiagnosticsToRows(EBuffer *b) {
+  if (!b) return;
+  for (int i = 0; i < b->numrows; i++)
+    b->row[i].diag_severity = 0;
+  for (int i = 0; i < b->lsp.diag_count; i++) {
+    int line = b->lsp.diagnostics[i].line;
+    int sev  = b->lsp.diagnostics[i].severity;
+    if (line >= 0 && line < b->numrows) {
+      /* Error (1) takes priority over warning (2) */
+      if (b->row[line].diag_severity == 0 ||
+          (sev == 1 && b->row[line].diag_severity == 2))
+        b->row[line].diag_severity = sev;
+    }
+  }
+}
+
+/** Send the current buffer content to the LSP server as a didChange.
+ *  Called per-keystroke; no-op if the LSP client isn't initialised. */
+static void lspNotifyChange(EBuffer *b) {
+  if (!b || !b->filename || !b->lsp.initialized) return;
+  char uri[PATH_MAX + 8];
+  snprintf(uri, sizeof(uri), "file://%s", b->filename);
+  size_t len;
+  char *text = bufferToString(b, &len);
+  lsp_didChange(&b->lsp, uri, text);
+  free(text);
+}
+
+/** Start an LSP server for the given buffer if one is configured and not
+ *  already running.  Sends initialize + initialized + didOpen. */
+static void lspStartForBuffer(EBuffer *b) {
+  if (!b || !b->filename || !b->syntax) return;
+  if (b->lsp.initialized || b->lsp.fd_out >= 0) return; /* already up */
+  const char *cmd = lsp_cmd_for_syntax(b->syntax->name);
+  if (!cmd) return; /* no server configured for this language */
+  if (lsp_start(&b->lsp, cmd) < 0) return;
+  lsp_initialize(&b->lsp);
+  char uri[PATH_MAX + 8];
+  snprintf(uri, sizeof(uri), "file://%s", b->filename);
+  size_t len;
+  char *text = bufferToString(b, &len);
+  lsp_didOpen(&b->lsp, uri, text);
+  free(text);
+}
+
+/* ================================================================
+ * Diagnostics panel rendering
+ * ================================================================ */
+
+static void drawDiagPanel(abuf *ab) {
+  if (!S.show_diag_panel || S.diag_panel_actual_h <= 0) return;
+  EBuffer *b   = curBuf();
+  int panelX   = S.editor_x;
+  int panelW   = S.editor_w;
+  int panelY   = S.diag_panel_y;
+  int itemRows = S.diag_panel_actual_h - 1; /* minus the header row */
+
+  int nerr  = b ? b->lsp.diag_error_count   : 0;
+  int nwarn = b ? b->lsp.diag_warning_count  : 0;
+  int ntotal = b ? b->lsp.diag_count          : 0;
+
+  RGB hbg = THEME_TOPBAR_BG[S.theme];
+  RGB bg  = THEME_DIALOG_BG[S.theme];
+  RGB fg  = THEME_EDITOR_FG[S.theme];
+
+  /* ---- Header row ---- */
+  abGoto(ab, panelY, panelX);
+  if (S.drag_type == 3) {
+    abBg(ab, THEME_ACCENT[S.theme]);
+    abFg(ab, THEME_TOPBAR_BG[S.theme]);
+  } else {
+    abBg(ab, hbg);
+    abFg(ab, THEME_STATUSBAR_FG[S.theme]);
+  }
+
+  char hdr[128] = "";
+  /* Server name */
+  if (b && b->lsp.initialized && b->lsp.server_cmd) {
+    char sname[32] = ""; int k = 0;
+    for (int i = 0; b->lsp.server_cmd[i] && b->lsp.server_cmd[i] != ' ' && k < 31; i++)
+      sname[k++] = b->lsp.server_cmd[i];
+    sname[k] = '\0';
+    snprintf(hdr, sizeof(hdr), " PROBLEMS  %s  ", sname);
+  } else if (b && b->syntax && !lsp_cmd_for_syntax(b->syntax->name)) {
+    snprintf(hdr, sizeof(hdr), " PROBLEMS  [no LSP for %s]  ", b->syntax->name);
+  } else {
+    snprintf(hdr, sizeof(hdr), " PROBLEMS  ");
+  }
+  int used = (int)strlen(hdr);
+  abAppendStr(ab, hdr);
+
+  /* Error / warning counts */
+  if (nerr > 0) {
+    abFg(ab, (RGB){255, 90, 90});
+    char ec[16]; snprintf(ec, sizeof(ec), "x%d ", nerr);
+    abAppendStr(ab, ec); used += (int)strlen(ec);
+  }
+  if (nwarn > 0) {
+    abFg(ab, (RGB){255, 210, 60});
+    char wc[16]; snprintf(wc, sizeof(wc), "!%d ", nwarn);
+    abAppendStr(ab, wc); used += (int)strlen(wc);
+  }
+  if (nerr == 0 && nwarn == 0 && b && b->lsp.initialized) {
+    abFg(ab, (RGB){80, 210, 80});
+    abAppendStr(ab, "OK "); used += 3;
+  }
+
+  /* Right-hand hint */
+  abFg(ab, (RGB){140, 140, 140});
+  const char *hint = " Ctrl+L: close";
+  int hlen = (int)strlen(hint);
+  int pad = panelW - used - hlen;
+  for (int i = 0; i < pad; i++) abAppendStr(ab, " ");
+  abAppendStr(ab, hint);
+  abReset(ab);
+
+  /* ---- Diagnostic item rows ---- */
+  for (int r = 0; r < itemRows; r++) {
+    int diagIdx = r + S.diag_scroll;
+    abGoto(ab, panelY + 1 + r, panelX);
+    abBg(ab, bg);
+
+    if (b && diagIdx < ntotal) {
+      Diagnostic *d = &b->lsp.diagnostics[diagIdx];
+      /* Severity symbol */
+      if (d->severity == 1) {
+        abFg(ab, (RGB){255, 80, 80});
+        abAppendStr(ab, " x ");
+      } else {
+        abFg(ab, (RGB){255, 210, 50});
+        abAppendStr(ab, " ! ");
+      }
+      /* Location [line:col] */
+      abFg(ab, (RGB){140, 140, 140});
+      char loc[32];
+      int loclen = snprintf(loc, sizeof(loc), "[%d:%d] ", d->line + 1, d->col + 1);
+      abAppendStr(ab, loc);
+      /* Message — truncate to fit */
+      abFg(ab, fg);
+      const char *msg = d->message ? d->message : "";
+      int avail  = panelW - 3 - loclen;
+      if (avail < 0) avail = 0;
+      int mlen   = (int)strlen(msg);
+      if (mlen > avail) mlen = avail;
+      abAppend(ab, msg, mlen);
+      /* Padding to EOL */
+      int written = 3 + loclen + mlen;
+      for (int j = written; j < panelW; j++) abAppendStr(ab, " ");
+    } else {
+      abFg(ab, fg);
+      for (int j = 0; j < panelW; j++) abAppendStr(ab, " ");
+    }
+    abReset(ab);
+  }
+}
+
 /* ================================= refresh
  * ==================================== */
 static void refreshScreen(void) {
@@ -3189,6 +3482,7 @@ static void refreshScreen(void) {
   drawExplorer(&ab);
   drawTabBar(&ab);
   drawEditorArea(&ab);
+  drawDiagPanel(&ab);
   drawTerminalPane(&ab);
   drawDialog(&ab);
   drawPaletteDropdown(&ab);
@@ -3217,7 +3511,7 @@ static void refreshScreen(void) {
     EBuffer *b = curBuf();
     int contentY = S.editor_y + TABBAR_H;
     cy = contentY + (b->cy - b->rowoff);
-    cx = S.editor_x + 5 + (b->rx - b->coloff);
+    cx = S.editor_x + 6 + (b->rx - b->coloff);
   } else if (S.focus == FOCUS_TERMINAL && S.show_terminal) {
     cy = S.term_y + 1 + S.term.cy;
     cx = 1 + S.term.cx;
@@ -3507,22 +3801,27 @@ static void handleEditorKey(EBuffer *b, InputEvent *ev) {
     return;
   }
   if (key == KEY_PAGE_UP) {
-    b->cy -= S.editor_h;
-    if (b->cy < 0)
-      b->cy = 0;
-    b->cx = rowRxToCx(&b->row[b->cy], b->target_rx);
+    if (b->numrows > 0) {
+      b->cy -= S.editor_h;
+      if (b->cy < 0)
+        b->cy = 0;
+      b->cx = rowRxToCx(&b->row[b->cy], b->target_rx);
+    }
     return;
   }
   if (key == KEY_PAGE_DOWN) {
-    b->cy += S.editor_h;
-    if (b->cy >= b->numrows)
-      b->cy = b->numrows - 1;
-    if (b->cy < 0)
-      b->cy = 0;
-    b->cx = rowRxToCx(&b->row[b->cy], b->target_rx);
+    if (b->numrows > 0) {
+      b->cy += S.editor_h;
+      if (b->cy >= b->numrows)
+        b->cy = b->numrows - 1;
+      if (b->cy < 0)
+        b->cy = 0;
+      b->cx = rowRxToCx(&b->row[b->cy], b->target_rx);
+    }
     return;
   }
   if (key == '\t') {
+    if (b->numrows == 0) return;
     /* Insert TAB_STOP spaces so tabs always align to column boundaries */
     int rx = rowCxToRx(&b->row[b->cy], b->cx);
     int spaces = TAB_STOP - (rx % TAB_STOP);
@@ -3587,17 +3886,48 @@ static void handleEditorKey(EBuffer *b, InputEvent *ev) {
 }
 
 static void handleMouseClick(InputEvent *ev) {
-  if (ev->mrelease)
-    return; /* only act on press */
   if (S.dlg.type != DLG_NONE)
     return;
-  if (S.palette_active) {
+  if (S.palette_active && !ev->mrelease) {
     closePalette();
     return;
   }
   int mx = ev->mx, my = ev->my;
+  if (mx < 0) mx = 0;
+  if (my < 0) my = 0;
 
-  /* Mouse Wheel Scroll Handling (SGR 64 = Up, 65 = Down) */
+  /* ---- Mouse drag motion (left button held + moved, mbutton bit 5 set) ---- */
+  if ((ev->mbutton & ~3) == 32 && !ev->mrelease) {
+    if (S.drag_type == 1) { /* explorer width */
+      int nw = mx;
+      if (nw < EXPLORER_MIN_W) nw = EXPLORER_MIN_W;
+      if (nw > S.screencols / 2) nw = S.screencols / 2;
+      S.explorer_user_w = nw;
+      computeLayout();
+    } else if (S.drag_type == 2) { /* terminal height */
+      int nh = S.screenrows - my - 1;
+      if (nh < TERM_MIN_H) nh = TERM_MIN_H;
+      if (nh > S.screenrows / 2) nh = S.screenrows / 2;
+      S.terminal_height = nh;
+      computeLayout();
+    } else if (S.drag_type == 3) { /* diag panel height */
+      int panel_bottom = S.diag_panel_y + S.diag_panel_actual_h;
+      int nh = panel_bottom - my;
+      if (nh < 2)  nh = 2;
+      if (nh > 20) nh = 20;
+      S.diag_panel_h = nh;
+      computeLayout();
+    }
+    return;
+  }
+
+  /* ---- Release: clear drag state ---- */
+  if (ev->mrelease) {
+    S.drag_type = 0;
+    return;
+  }
+
+  /* ---- Mouse Wheel Scroll (SGR 64 = Up, 65 = Down) ---- */
   if (ev->mbutton == 64) {
     if (S.show_explorer && mx < S.explorer_width) {
       if (S.explorer_scroll > 0)
@@ -3608,6 +3938,9 @@ static void handleMouseClick(InputEvent *ev) {
         if (b->rowoff > 0)
           b->rowoff--;
       }
+    } else if (S.show_diag_panel && S.diag_panel_actual_h > 0 &&
+               my >= S.diag_panel_y && my < S.diag_panel_y + S.diag_panel_actual_h) {
+      if (S.diag_scroll > 0) S.diag_scroll--;
     }
     return;
   }
@@ -3620,6 +3953,10 @@ static void handleMouseClick(InputEvent *ev) {
         if (b->rowoff < b->numrows - 1)
           b->rowoff++;
       }
+    } else if (S.show_diag_panel && S.diag_panel_actual_h > 0 &&
+               my >= S.diag_panel_y && my < S.diag_panel_y + S.diag_panel_actual_h) {
+      EBuffer *b = curBuf();
+      if (b && S.diag_scroll < b->lsp.diag_count - 1) S.diag_scroll++;
     }
     return;
   }
@@ -3629,6 +3966,29 @@ static void handleMouseClick(InputEvent *ev) {
     return; /* release-as-3 in some terminals; ignore */
 
   g_last_edit_type = LAST_EDIT_NONE;
+
+  /* ---- Border click → start pane resize drag ---- */
+  /* Explorer/editor vertical border */
+  if (S.show_explorer && mx == S.explorer_width && my >= S.explorer_y) {
+    S.drag_type = 1;
+    S.drag_start_val = S.explorer_width;
+    if (S.explorer_user_w == 0)
+      S.explorer_user_w = S.explorer_width; /* lock current auto width */
+    return;
+  }
+  /* Terminal top border */
+  if (S.show_terminal && S.term_h > 0 && my == S.term_y) {
+    S.drag_type = 2;
+    S.drag_start_val = S.terminal_height;
+    return;
+  }
+  /* Diag panel header row → resize panel height */
+  if (S.show_diag_panel && S.diag_panel_actual_h > 0 &&
+      my == S.diag_panel_y && mx >= S.editor_x) {
+    S.drag_type = 3;
+    S.drag_start_val = S.diag_panel_h;
+    return;
+  }
 
   if (my == 0) {
     S.focus = FOCUS_EDITOR;
@@ -3684,10 +4044,12 @@ static void handleMouseClick(InputEvent *ev) {
     if (filerow < 0)
       filerow = 0;
     b->cy = filerow;
-    int gutterW = 5;
+    int gutterW = 6;
     int col = (mx - S.editor_x - gutterW) + b->coloff;
     if (col < 0)
       col = 0;
+    if (b->numrows == 0)
+      return;
     erow *row = &b->row[b->cy];
     b->cx = rowRxToCx(row, col);
     b->target_rx = col;
@@ -3778,6 +4140,11 @@ static int globalKeyHandled(int key) {
   case KEY_CTRL_LEFT:
     if (S.ntabs > 0)
       S.curtab = (S.curtab - 1 + S.ntabs) % S.ntabs;
+    return 1;
+  case CTRL_KEY('l'):
+    S.show_diag_panel = !S.show_diag_panel;
+    S.diag_scroll = 0;
+    computeLayout();
     return 1;
   }
   return 0;
@@ -3995,6 +4362,9 @@ int main(int argc, char **argv) {
   S.show_terminal = 1;
   S.terminal_height = 12;
   S.focus = FOCUS_EDITOR;
+  S.show_diag_panel = 1;   /* problems panel open by default */
+  S.diag_panel_h    = 6;   /* desired height in rows */
+  S.diag_scroll     = 0;
 
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -4075,6 +4445,14 @@ int main(int argc, char **argv) {
       if (S.term.master_fd > maxfd)
         maxfd = S.term.master_fd;
     }
+    /* Add LSP server fds so diagnostics arrive without blocking */
+    for (int i = 0; i < S.ntabs; i++) {
+      if (S.tabs[i].lsp.fd_out >= 0) {
+        FD_SET(S.tabs[i].lsp.fd_out, &rfds);
+        if (S.tabs[i].lsp.fd_out > maxfd)
+          maxfd = S.tabs[i].lsp.fd_out;
+      }
+    }
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 150000;
@@ -4093,6 +4471,15 @@ int main(int argc, char **argv) {
         termFeed(&S.term, termbuf, (size_t)n);
       else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
         S.term.alive = 0;
+    }
+
+    /* Poll all LSP servers for new diagnostics */
+    for (int i = 0; i < S.ntabs; i++) {
+      if (S.tabs[i].lsp.fd_out >= 0 &&
+          FD_ISSET(S.tabs[i].lsp.fd_out, &rfds)) {
+        lsp_read(&S.tabs[i].lsp);
+        applyDiagnosticsToRows(&S.tabs[i]);
+      }
     }
 
     if (FD_ISSET(STDIN_FILENO, &rfds)) {
