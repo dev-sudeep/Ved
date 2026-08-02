@@ -15,6 +15,7 @@
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#define _DARWIN_C_SOURCE
 
 #include "lsp.h"
 
@@ -198,15 +199,91 @@ static const char *jstr(const char *p, char *out, int outsz) {
  * Send helpers
  * ================================================================ */
 
+void lsp_flush(LspClient *c) {
+    if (!c || c->fd_in < 0 || c->out_len <= 0) return;
+    ssize_t w = write(c->fd_in, c->out_buf, (size_t)c->out_len);
+    if (w > 0) {
+        if (w < c->out_len) {
+            memmove(c->out_buf, c->out_buf + w, (size_t)(c->out_len - w));
+            c->out_len -= (int)w;
+        } else {
+            c->out_len = 0;
+        }
+    } else if (w < 0 && (errno == EPIPE || errno == EBADF)) {
+        close(c->fd_in);  c->fd_in = -1;
+        if (c->fd_out >= 0) { close(c->fd_out); c->fd_out = -1; }
+        c->initialized = 0;
+        c->out_len = 0;
+    }
+}
+
 static void lsp_send_raw(LspClient *c, const char *body) {
     if (!c || c->fd_in < 0 || !body) return;
     int blen = (int)strlen(body);
     char header[64];
     int hlen = snprintf(header, sizeof(header),
                         "Content-Length: %d\r\n\r\n", blen);
-    ssize_t w;
-    w = write(c->fd_in, header, (size_t)hlen); (void)w;
-    w = write(c->fd_in, body,   (size_t)blen); (void)w;
+    int total_len = hlen + blen;
+
+    /* Flush existing queue if any */
+    if (c->out_len > 0) {
+        lsp_flush(c);
+    }
+
+    int written_bytes = 0;
+    if (c->out_len == 0) {
+        ssize_t w1 = write(c->fd_in, header, (size_t)hlen);
+        if (w1 > 0) {
+            if (w1 == hlen) {
+                ssize_t w2 = write(c->fd_in, body, (size_t)blen);
+                if (w2 > 0) {
+                    written_bytes = hlen + (int)w2;
+                } else if (w2 < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    if (errno == EPIPE || errno == EBADF) {
+                        close(c->fd_in); c->fd_in = -1;
+                        if (c->fd_out >= 0) { close(c->fd_out); c->fd_out = -1; }
+                        c->initialized = 0;
+                    }
+                    return;
+                } else {
+                    written_bytes = hlen;
+                }
+            } else {
+                written_bytes = (int)w1;
+            }
+        } else if (w1 < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (errno == EPIPE || errno == EBADF) {
+                close(c->fd_in); c->fd_in = -1;
+                if (c->fd_out >= 0) { close(c->fd_out); c->fd_out = -1; }
+                c->initialized = 0;
+            }
+            return;
+        }
+    }
+
+    /* Queue unwritten remainder to out_buf */
+    if (written_bytes < total_len) {
+        int rem = total_len - written_bytes;
+        int need = c->out_len + rem;
+        if (need > c->out_cap) {
+            int newcap = c->out_cap ? c->out_cap * 2 : 4096;
+            if (newcap < need) newcap = need;
+            char *nb = realloc(c->out_buf, (size_t)newcap);
+            if (!nb) return;
+            c->out_buf = nb;
+            c->out_cap = newcap;
+        }
+        if (written_bytes < hlen) {
+            memcpy(c->out_buf + c->out_len, header + written_bytes, (size_t)(hlen - written_bytes));
+            c->out_len += (hlen - written_bytes);
+            memcpy(c->out_buf + c->out_len, body, (size_t)blen);
+            c->out_len += blen;
+        } else {
+            int body_written = written_bytes - hlen;
+            memcpy(c->out_buf + c->out_len, body + body_written, (size_t)(blen - body_written));
+            c->out_len += (blen - body_written);
+        }
+    }
 }
 
 /* Send a JSON-RPC notification (no id). params may be NULL → "{}". */
@@ -244,6 +321,7 @@ static void lsp_request(LspClient *c, const char *method, const char *params) {
 
 int lsp_start(LspClient *client, const char *cmd) {
     if (!client || !cmd) return -1;
+    signal(SIGPIPE, SIG_IGN);
     memset(client, 0, sizeof(*client));
     client->fd_in = client->fd_out = -1;
     client->pid   = -1;
@@ -296,9 +374,12 @@ int lsp_start(LspClient *client, const char *cmd) {
     fcntl(client->fd_in,  F_SETFD, FD_CLOEXEC);
     fcntl(client->fd_out, F_SETFD, FD_CLOEXEC);
 
-    /* Non-blocking reads so the TUI never stalls waiting for the server */
-    int fl = fcntl(client->fd_out, F_GETFL, 0);
-    if (fl >= 0) fcntl(client->fd_out, F_SETFL, fl | O_NONBLOCK);
+    /* Non-blocking reads and writes so the TUI never stalls waiting for the server */
+    int fl_out = fcntl(client->fd_out, F_GETFL, 0);
+    if (fl_out >= 0) fcntl(client->fd_out, F_SETFL, fl_out | O_NONBLOCK);
+
+    int fl_in = fcntl(client->fd_in, F_GETFL, 0);
+    if (fl_in >= 0) fcntl(client->fd_in, F_SETFL, fl_in | O_NONBLOCK);
 
     client->server_cmd = strdup(cmd);
     return 0;
@@ -307,12 +388,20 @@ int lsp_start(LspClient *client, const char *cmd) {
 void lsp_initialize(LspClient *client) {
     if (!client || client->fd_in < 0) return;
 
+    char cwd[PATH_MAX];
+    char root_uri[PATH_MAX + 32];
+    if (getcwd(cwd, sizeof(cwd))) {
+        snprintf(root_uri, sizeof(root_uri), "\"file://%s\"", cwd);
+    } else {
+        snprintf(root_uri, sizeof(root_uri), "null");
+    }
+
     char params[2048];
     snprintf(params, sizeof(params),
         "{"
           "\"processId\":%d,"
           "\"clientInfo\":{\"name\":\"ved\",\"version\":\"0.1\"},"
-          "\"rootUri\":null,"
+          "\"rootUri\":%s,"
           "\"capabilities\":{"
             "\"textDocument\":{"
               "\"publishDiagnostics\":{\"relatedInformation\":false},"
@@ -320,14 +409,15 @@ void lsp_initialize(LspClient *client) {
                 "\"dynamicRegistration\":false,"
                 "\"willSave\":false,"
                 "\"didSave\":true,"
-                "\"willSaveWaitUntil\":false"
+                "\"willSaveWaitUntil\":false,"
+                "\"change\":2"
               "}"
             "}"
           "},"
           "\"trace\":\"off\","
           "\"workspaceFolders\":null"
         "}",
-        (int)getpid());
+        (int)getpid(), root_uri);
 
     lsp_request(client, "initialize", params);
     /* Send 'initialized' immediately; most servers tolerate the ordering. */
@@ -357,8 +447,13 @@ void lsp_didOpen(LspClient *client, const char *uri, const char *text) {
     if (!client || !client->initialized || client->fd_in < 0) return;
     if (!uri || !text) return;
 
-    const char *langid = lang_id_from_uri(uri);
     size_t tlen = strlen(text);
+    if (tlen > MAX_LSP_FULL_SYNC_SIZE) {
+        lsp_didOpen_chunked(client, uri, text);
+        return;
+    }
+
+    const char *langid = lang_id_from_uri(uri);
     size_t elen = tlen * 2 + 8;
     size_t ulen = strlen(uri) * 2 + 8;
 
@@ -383,6 +478,121 @@ void lsp_didOpen(LspClient *client, const char *uri, const char *text) {
 
     lsp_notify(client, "textDocument/didOpen", params);
     free(etext); free(euri); free(params);
+}
+
+void lsp_didChange_range(LspClient *client, const char *uri, int start_line, int start_col, int end_line, int end_col, const char *inserted_text) {
+    if (!client || !client->initialized || client->fd_in < 0) return;
+    if (!uri || !inserted_text) return;
+
+    size_t tlen = strlen(inserted_text);
+    size_t elen = tlen * 2 + 8;
+    size_t ulen = strlen(uri) * 2 + 8;
+
+    char *etext = malloc(elen);
+    char *euri  = malloc(ulen);
+    if (!etext || !euri) { free(etext); free(euri); return; }
+    json_escape(etext, (int)elen, inserted_text);
+    json_escape(euri,  (int)ulen, uri);
+
+    size_t psz = elen + ulen + 512;
+    char *params = malloc(psz);
+    if (!params) { free(etext); free(euri); return; }
+
+    snprintf(params, psz,
+        "{\"textDocument\":{"
+          "\"uri\":\"%s\","
+          "\"version\":%d"
+        "},"
+        "\"contentChanges\":[{"
+          "\"range\":{"
+            "\"start\":{\"line\":%d,\"character\":%d},"
+            "\"end\":{\"line\":%d,\"character\":%d}"
+          "},"
+          "\"text\":\"%s\""
+        "}]}",
+        euri, ++client->version, start_line, start_col, end_line, end_col, etext);
+
+    lsp_notify(client, "textDocument/didChange", params);
+    free(etext); free(euri); free(params);
+}
+
+void lsp_didOpen_chunked(LspClient *client, const char *uri, const char *text) {
+    if (!client || !client->initialized || client->fd_in < 0) return;
+    if (!uri || !text) return;
+
+    size_t tlen = strlen(text);
+    if (tlen <= MAX_LSP_FULL_SYNC_SIZE) {
+        lsp_didOpen(client, uri, text);
+        return;
+    }
+
+    char *chunk = malloc(LSP_CHUNK_SIZE + 1);
+    if (!chunk) return;
+
+    size_t offset = 0;
+    size_t chunk_len = tlen > LSP_CHUNK_SIZE ? LSP_CHUNK_SIZE : tlen;
+    memcpy(chunk, text, chunk_len);
+    chunk[chunk_len] = '\0';
+
+    /* Send first chunk via didOpen */
+    const char *langid = lang_id_from_uri(uri);
+    size_t elen = chunk_len * 2 + 8;
+    size_t ulen = strlen(uri) * 2 + 8;
+    char *etext = malloc(elen);
+    char *euri  = malloc(ulen);
+    if (etext && euri) {
+        json_escape(etext, (int)elen, chunk);
+        json_escape(euri,  (int)ulen, uri);
+        size_t psz = elen + ulen + 256;
+        char *params = malloc(psz);
+        if (params) {
+            snprintf(params, psz,
+                "{\"textDocument\":{"
+                  "\"uri\":\"%s\","
+                  "\"languageId\":\"%s\","
+                  "\"version\":%d,"
+                  "\"text\":\"%s\""
+                "}}",
+                euri, langid, ++client->version, etext);
+            lsp_notify(client, "textDocument/didOpen", params);
+            free(params);
+        }
+        free(etext); free(euri);
+    }
+    offset += chunk_len;
+
+    int current_line = 0;
+    int current_col = 0;
+    for (size_t i = 0; i < chunk_len; i++) {
+        if (chunk[i] == '\n') {
+            current_line++;
+            current_col = 0;
+        } else {
+            current_col++;
+        }
+    }
+
+    /* Stream remaining chunks via incremental didChange range appends */
+    while (offset < tlen) {
+        chunk_len = (tlen - offset > LSP_CHUNK_SIZE) ? LSP_CHUNK_SIZE : (tlen - offset);
+        memcpy(chunk, text + offset, chunk_len);
+        chunk[chunk_len] = '\0';
+
+        lsp_didChange_range(client, uri, current_line, current_col, current_line, current_col, chunk);
+        lsp_flush(client);
+
+        for (size_t i = 0; i < chunk_len; i++) {
+            if (chunk[i] == '\n') {
+                current_line++;
+                current_col = 0;
+            } else {
+                current_col++;
+            }
+        }
+        offset += chunk_len;
+    }
+
+    free(chunk);
 }
 
 void lsp_didChange(LspClient *client, const char *uri, const char *text) {
@@ -539,14 +749,18 @@ void lsp_read(LspClient *client) {
     if (n == 0 ||
         (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
         close(client->fd_out);   client->fd_out = -1;
-        if (client->fd_in >= 0) { close(client->fd_in); client->fd_in = -1; }
+        if (client->fd_in >= 3) { close(client->fd_in); client->fd_in = -1; }
+        else                      client->fd_in = -1;
         client->initialized = 0;
         return;
     }
 
-    /* Extract and dispatch complete Content-Length-framed messages */
+    if (!client->read_buf || client->read_len <= 0) return;
+
+    /* Extract and dispatch complete Content-Length-framed messages without O(N^2) memmove */
+    int read_offset = 0;
     while (1) {
-        char *cl = strstr(client->read_buf, "Content-Length: ");
+        char *cl = strstr(client->read_buf + read_offset, "Content-Length: ");
         if (!cl) break;
         int clen = atoi(cl + 16);
         if (clen <= 0) break;
@@ -555,8 +769,8 @@ void lsp_read(LspClient *client) {
         if (!hdr_end) break;
         hdr_end += 4;
 
-        int offset = (int)(hdr_end - client->read_buf);
-        if (client->read_len - offset < clen) break; /* body incomplete */
+        int msg_offset = (int)(hdr_end - client->read_buf);
+        if (client->read_len - msg_offset < clen) break; /* body incomplete */
 
         /* NUL-terminate the body temporarily */
         char saved = hdr_end[clen];
@@ -564,12 +778,15 @@ void lsp_read(LspClient *client) {
         lsp_dispatch(client, hdr_end);
         hdr_end[clen] = saved;
 
-        /* Consume the processed bytes */
-        int consumed = offset + clen;
-        memmove(client->read_buf,
-                client->read_buf + consumed,
-                (size_t)(client->read_len - consumed));
-        client->read_len -= consumed;
+        read_offset = msg_offset + clen;
+    }
+
+    if (read_offset > 0) {
+        int rem = client->read_len - read_offset;
+        if (rem > 0) {
+            memmove(client->read_buf, client->read_buf + read_offset, (size_t)rem);
+        }
+        client->read_len = rem;
         client->read_buf[client->read_len] = '\0';
     }
 }
@@ -599,6 +816,10 @@ void lsp_free(LspClient *client) {
 
     free(client->read_buf);  client->read_buf = NULL;
     client->read_len = client->read_cap = 0;
+    free(client->out_buf);   client->out_buf = NULL;
+    client->out_len = client->out_cap = 0;
+    client->last_change_ms = 0;
+    client->is_dirty = 0;
     free(client->server_cmd); client->server_cmd = NULL;
 
     for (int i = 0; i < client->diag_count; i++)

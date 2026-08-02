@@ -48,6 +48,14 @@
 #endif
 
 #define VED_VERSION "0.1"
+
+static uint64_t getTimeMs(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    }
+    return (uint64_t)time(NULL) * 1000ULL;
+}
 #define TAB_STOP 4
 #define MAX_TABS 32
 #define STATUS_MSG_SECS 4
@@ -1409,6 +1417,31 @@ static void editorOpen(const char *filename, int forceNewTab) {
   S.focus = FOCUS_EDITOR;
 }
 
+static void getBufferUri(EBuffer *b, char *out, size_t outsz) {
+  if (!b || !b->filename) {
+    if (outsz > 0) out[0] = '\0';
+    return;
+  }
+  char abs_path[PATH_MAX];
+  if (b->filename[0] == '/') {
+    snprintf(abs_path, sizeof(abs_path), "%s", b->filename);
+  } else {
+    if (realpath(b->filename, abs_path) == NULL) {
+      char cwd[PATH_MAX];
+      if (getcwd(cwd, sizeof(cwd))) {
+        snprintf(abs_path, sizeof(abs_path), "%s/%s", cwd, b->filename);
+      } else {
+        snprintf(abs_path, sizeof(abs_path), "%s", b->filename);
+      }
+    }
+  }
+  if (abs_path[0] == '/') {
+    snprintf(out, outsz, "file://%s", abs_path);
+  } else {
+    snprintf(out, outsz, "file:///%s", abs_path);
+  }
+}
+
 static void editorSaveAs(EBuffer *b, const char *filename) {
   size_t len;
   char *data = bufferToString(b, &len);
@@ -1428,6 +1461,15 @@ static void editorSaveAs(EBuffer *b, const char *filename) {
   updateSyntaxAll(b);
   b->dirty = 0;
   setStatus("Saved %s (%zu bytes)", filename, len);
+  if (b->lsp.initialized) {
+    b->lsp.is_dirty = 0;
+    char uri[PATH_MAX + 16];
+    getBufferUri(b, uri, sizeof(uri));
+    size_t dlen;
+    char *text = bufferToString(b, &dlen);
+    lsp_didChange(&b->lsp, uri, text);
+    free(text);
+  }
   if (S.have_root)
     explorerRebuildFlat();
 }
@@ -3330,16 +3372,26 @@ static void applyDiagnosticsToRows(EBuffer *b) {
   }
 }
 
-/** Send the current buffer content to the LSP server as a didChange.
- *  Called per-keystroke; no-op if the LSP client isn't initialised. */
+/** Flag the current buffer as having pending LSP changes (debounced per keystroke). */
 static void lspNotifyChange(EBuffer *b) {
   if (!b || !b->filename || !b->lsp.initialized) return;
-  char uri[PATH_MAX + 8];
-  snprintf(uri, sizeof(uri), "file://%s", b->filename);
-  size_t len;
-  char *text = bufferToString(b, &len);
-  lsp_didChange(&b->lsp, uri, text);
-  free(text);
+  b->lsp.is_dirty = 1;
+  b->lsp.last_change_ms = getTimeMs();
+}
+
+/** Flush debounced LSP changes if 300ms have elapsed since last edit. */
+static void lspFlushPendingChanges(EBuffer *b) {
+  if (!b || !b->filename || !b->lsp.initialized || !b->lsp.is_dirty) return;
+  uint64_t now = getTimeMs();
+  if (now - b->lsp.last_change_ms >= 300) {
+    b->lsp.is_dirty = 0;
+    char uri[PATH_MAX + 16];
+    getBufferUri(b, uri, sizeof(uri));
+    size_t len;
+    char *text = bufferToString(b, &len);
+    lsp_didChange(&b->lsp, uri, text);
+    free(text);
+  }
 }
 
 /** Start an LSP server for the given buffer if one is configured and not
@@ -3351,11 +3403,11 @@ static void lspStartForBuffer(EBuffer *b) {
   if (!cmd) return; /* no server configured for this language */
   if (lsp_start(&b->lsp, cmd) < 0) return;
   lsp_initialize(&b->lsp);
-  char uri[PATH_MAX + 8];
-  snprintf(uri, sizeof(uri), "file://%s", b->filename);
+  char uri[PATH_MAX + 16];
+  getBufferUri(b, uri, sizeof(uri));
   size_t len;
   char *text = bufferToString(b, &len);
-  lsp_didOpen(&b->lsp, uri, text);
+  lsp_didOpen_chunked(&b->lsp, uri, text);
   free(text);
 }
 
@@ -4434,10 +4486,16 @@ int main(int argc, char **argv) {
         S.term.alive = 0;
     }
 
+    /* Flush debounced LSP changes if timer expired */
+    for (int i = 0; i < S.ntabs; i++) {
+      lspFlushPendingChanges(&S.tabs[i]);
+    }
+
     refreshScreen();
 
-    fd_set rfds;
+    fd_set rfds, wfds;
     FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
     FD_SET(STDIN_FILENO, &rfds);
     int maxfd = STDIN_FILENO;
     if (S.term.alive) {
@@ -4445,23 +4503,38 @@ int main(int argc, char **argv) {
       if (S.term.master_fd > maxfd)
         maxfd = S.term.master_fd;
     }
-    /* Add LSP server fds so diagnostics arrive without blocking */
+    /* Add LSP server fds so diagnostics arrive and pending writes flush without blocking */
     for (int i = 0; i < S.ntabs; i++) {
       if (S.tabs[i].lsp.fd_out >= 0) {
         FD_SET(S.tabs[i].lsp.fd_out, &rfds);
         if (S.tabs[i].lsp.fd_out > maxfd)
           maxfd = S.tabs[i].lsp.fd_out;
       }
+      if (S.tabs[i].lsp.fd_in >= 0 && S.tabs[i].lsp.out_len > 0) {
+        FD_SET(S.tabs[i].lsp.fd_in, &wfds);
+        if (S.tabs[i].lsp.fd_in > maxfd)
+          maxfd = S.tabs[i].lsp.fd_in;
+      }
     }
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 150000;
-    int rv = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+    tv.tv_usec = 50000;
+    int rv = select(maxfd + 1, &rfds, &wfds, NULL, &tv);
     if (rv < 0) {
       if (errno == EINTR)
         continue;
       break;
     }
+
+    /* Flush pending outgoing bytes to LSP servers */
+    for (int i = 0; i < S.ntabs; i++) {
+      if (S.tabs[i].lsp.fd_in >= 0 && S.tabs[i].lsp.out_len > 0) {
+        if (FD_ISSET(S.tabs[i].lsp.fd_in, &wfds)) {
+          lsp_flush(&S.tabs[i].lsp);
+        }
+      }
+    }
+
     if (rv == 0)
       continue;
 
