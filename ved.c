@@ -98,6 +98,15 @@ enum EditorKey {
   KEY_PAGE_DOWN,
   KEY_CTRL_LEFT,
   KEY_CTRL_RIGHT,
+  KEY_CTRL_UP,
+  KEY_CTRL_DOWN,
+  KEY_SHIFT_LEFT,
+  KEY_SHIFT_RIGHT,
+  KEY_SHIFT_UP,
+  KEY_SHIFT_DOWN,
+  KEY_CTRL_COMMA,
+  KEY_CTRL_PERIOD,
+  KEY_SHIFT_TAB,
   KEY_MOUSE,
   KEY_ESCAPE_ALONE
 };
@@ -289,6 +298,7 @@ static int rowRxToCx(erow *row, int rx);
 static void dieMsg(const char *s);
 static void refreshScreen(void);
 static void setStatus(const char *fmt, ...);
+static void updateDiagPanelVisibilityForCurrentBuffer(void);
 static EBuffer *curBuf(void);
 static void editorOpen(const char *filename, int newTab);
 static void editorSave(EBuffer *b);
@@ -1067,43 +1077,182 @@ static void editorInsertChar(EBuffer *b, int c) {
   lspNotifyChange(b);
 }
 
+static int isLanguagePython(EBuffer *b) {
+  if (!b) return 0;
+  if (b->syntax && !strcasecmp(b->syntax->name, "Python")) return 1;
+  if (b->filename && strlen(b->filename) > 3 &&
+      !strcasecmp(b->filename + strlen(b->filename) - 3, ".py")) return 1;
+  return 0;
+}
+
+static int isLanguageShell(EBuffer *b) {
+  if (!b) return 0;
+  if (b->syntax && !strcasecmp(b->syntax->name, "Shell")) return 1;
+  if (b->filename && (strstr(b->filename, ".sh") || strstr(b->filename, ".bash"))) return 1;
+  return 0;
+}
+
+static int shouldIncreaseIndent(EBuffer *b, erow *row, int cx) {
+  if (!row || cx <= 0) return 0;
+  int i = cx - 1;
+  while (i >= 0 && (row->chars[i] == ' ' || row->chars[i] == '\t')) i--;
+  if (i < 0) return 0;
+
+  char ch = row->chars[i];
+  if (ch == '{' || ch == '(' || ch == '[') return 1;
+
+  if (isLanguagePython(b)) {
+    if (ch == ':') return 1;
+  }
+
+  if (isLanguageShell(b)) {
+    if (i >= 1 && row->chars[i-1] == 'd' && row->chars[i] == 'o') {
+      if (i - 2 < 0 || isspace((unsigned char)row->chars[i-2])) return 1;
+    }
+    if (i >= 3 && !strncmp(&row->chars[i-3], "then", 4)) {
+      if (i - 4 < 0 || isspace((unsigned char)row->chars[i-4])) return 1;
+    }
+  }
+
+  return 0;
+}
+
+static void autoUnindentClosingBracket(EBuffer *b, char close_ch) {
+  if (!b || b->cy >= b->numrows) return;
+  erow *row = &b->row[b->cy];
+
+  for (int i = 0; i < b->cx; i++) {
+    if (row->chars[i] != ' ' && row->chars[i] != '\t') return;
+  }
+
+  char open_ch = '{';
+  if (close_ch == ')') open_ch = '(';
+  if (close_ch == ']') open_ch = '[';
+
+  int depth = 1;
+  int open_indent = -1;
+  for (int r = b->cy - 1; r >= 0; r--) {
+    erow *prev = &b->row[r];
+    for (int i = prev->size - 1; i >= 0; i--) {
+      if (prev->chars[i] == close_ch) depth++;
+      else if (prev->chars[i] == open_ch) {
+        depth--;
+        if (depth == 0) {
+          int ilen = 0;
+          while (ilen < prev->size && (prev->chars[ilen] == ' ' || prev->chars[ilen] == '\t')) ilen++;
+          open_indent = ilen;
+          break;
+        }
+      }
+    }
+    if (open_indent >= 0) break;
+  }
+
+  if (open_indent >= 0 && b->cx > open_indent) {
+    while (b->cx > open_indent) {
+      rowDelChar(row, b->cx - 1);
+      b->cx--;
+    }
+  }
+}
+
+static void editorUnindentLine(EBuffer *b) {
+  if (!b || b->cy >= b->numrows) return;
+  erow *row = &b->row[b->cy];
+  if (row->size == 0) return;
+
+  pushUndoSnapshot(b);
+  int to_del = 0;
+  while (to_del < TAB_STOP && to_del < row->size && row->chars[to_del] == ' ') {
+    to_del++;
+  }
+  if (to_del == 0 && row->size > 0 && row->chars[0] == '\t') {
+    to_del = 1;
+  }
+  if (to_del > 0) {
+    for (int i = 0; i < to_del; i++) {
+      rowDelChar(row, 0);
+      if (b->cx > 0) b->cx--;
+    }
+    bufMarkDirty(b);
+    updateSyntaxAll(b);
+    b->target_rx = rowCxToRx(&b->row[b->cy], b->cx);
+    lspNotifyChange(b);
+  }
+}
+
 static void editorInsertNewline(EBuffer *b) {
   pushUndoSnapshot(b);
   g_last_edit_type = LAST_EDIT_NONE;
-  if (b->cx == 0) {
-    bufferInsertRow(b, b->cy, "", 0);
-  } else {
-    erow *row = &b->row[b->cy];
-    bufferInsertRow(b, b->cy + 1, &row->chars[b->cx],
-                    (size_t)(row->size - b->cx));
-    row = &b->row[b->cy];
-    row->size = b->cx;
-    row->chars[row->size] = '\0';
-    updateRender(row);
+  if (b->numrows == 0) {
+    bufferInsertRow(b, 0, "", 0);
   }
-  b->cy++;
-  b->cx = 0;
 
-  if (b->cy > 0) {
-    erow *prev_row = &b->row[b->cy - 1];
-    int indent = 0;
-    while (indent < prev_row->size &&
-           (prev_row->chars[indent] == ' ' || prev_row->chars[indent] == '\t')) {
-      indent++;
+  erow *cur_row = &b->row[b->cy];
+  int cx = b->cx;
+
+  int is_bracket_split = 0;
+  if (cx > 0 && cx < cur_row->size) {
+    char left = cur_row->chars[cx - 1];
+    char right = cur_row->chars[cx];
+    if ((left == '{' && right == '}') ||
+        (left == '(' && right == ')') ||
+        (left == '[' && right == ']')) {
+      is_bracket_split = 1;
     }
-    if (indent > 0) {
-      for (int i = 0; i < indent; i++) {
-        rowInsertChar(&b->row[b->cy], b->cx++, prev_row->chars[i]);
-      }
+  }
+
+  int base_indent_len = 0;
+  while (base_indent_len < cur_row->size && base_indent_len < cx &&
+         (cur_row->chars[base_indent_len] == ' ' || cur_row->chars[base_indent_len] == '\t')) {
+    base_indent_len++;
+  }
+
+  if (is_bracket_split) {
+    bufferInsertRow(b, b->cy + 1, &cur_row->chars[cx], (size_t)(cur_row->size - cx));
+    cur_row = &b->row[b->cy];
+    cur_row->size = cx;
+    cur_row->chars[cur_row->size] = '\0';
+    updateRender(cur_row);
+
+    erow *right_row = &b->row[b->cy + 1];
+    for (int i = base_indent_len - 1; i >= 0; i--) {
+      rowInsertChar(right_row, 0, cur_row->chars[i]);
     }
-    int last_char_idx = prev_row->size - 1;
-    while (last_char_idx >= 0 &&
-           (prev_row->chars[last_char_idx] == ' ' || prev_row->chars[last_char_idx] == '\t')) {
-      last_char_idx--;
+
+    bufferInsertRow(b, b->cy + 1, "", 0);
+    b->cy++;
+    b->cx = 0;
+    erow *mid_row = &b->row[b->cy];
+
+    for (int i = 0; i < base_indent_len; i++) {
+      rowInsertChar(mid_row, b->cx++, cur_row->chars[i]);
     }
-    if (last_char_idx >= 0 && prev_row->chars[last_char_idx] == '{') {
+    for (int i = 0; i < TAB_STOP; i++) {
+      rowInsertChar(mid_row, b->cx++, ' ');
+    }
+  } else {
+    int inc_indent = shouldIncreaseIndent(b, cur_row, cx);
+
+    if (cx == 0) {
+      bufferInsertRow(b, b->cy, "", 0);
+    } else {
+      bufferInsertRow(b, b->cy + 1, &cur_row->chars[cx], (size_t)(cur_row->size - cx));
+      cur_row = &b->row[b->cy];
+      cur_row->size = cx;
+      cur_row->chars[cur_row->size] = '\0';
+      updateRender(cur_row);
+    }
+    b->cy++;
+    b->cx = 0;
+
+    erow *new_row = &b->row[b->cy];
+    for (int i = 0; i < base_indent_len; i++) {
+      rowInsertChar(new_row, b->cx++, cur_row->chars[i]);
+    }
+    if (inc_indent) {
       for (int i = 0; i < TAB_STOP; i++) {
-        rowInsertChar(&b->row[b->cy], b->cx++, ' ');
+        rowInsertChar(new_row, b->cx++, ' ');
       }
     }
   }
@@ -1125,8 +1274,24 @@ static void editorDelChar(EBuffer *b) {
   g_last_edit_type = LAST_EDIT_DEL;
   erow *row = &b->row[b->cy];
   if (b->cx > 0) {
-    rowDelChar(row, b->cx - 1);
-    b->cx--;
+    int is_leading_spaces = 1;
+    for (int i = 0; i < b->cx; i++) {
+      if (row->chars[i] != ' ') {
+        is_leading_spaces = 0;
+        break;
+      }
+    }
+    if (is_leading_spaces) {
+      int spaces_to_del = b->cx % TAB_STOP;
+      if (spaces_to_del == 0) spaces_to_del = TAB_STOP;
+      for (int i = 0; i < spaces_to_del && b->cx > 0; i++) {
+        rowDelChar(row, b->cx - 1);
+        b->cx--;
+      }
+    } else {
+      rowDelChar(row, b->cx - 1);
+      b->cx--;
+    }
   } else {
     int prevlen = b->row[b->cy - 1].size;
     rowAppendString(&b->row[b->cy - 1], row->chars, (size_t)row->size);
@@ -1415,6 +1580,7 @@ static void editorOpen(const char *filename, int forceNewTab) {
     return;
   loadFileIntoBuffer(&S.tabs[idx], filename);
   S.focus = FOCUS_EDITOR;
+  updateDiagPanelVisibilityForCurrentBuffer();
 }
 
 static void getBufferUri(EBuffer *b, char *out, size_t outsz) {
@@ -2317,6 +2483,7 @@ static void closeTabForceIndex(int idx) {
     S.curtab = S.ntabs - 1;
   else if (S.curtab > idx)
     S.curtab--;
+  updateDiagPanelVisibilityForCurrentBuffer();
 }
 
 static void closeTab(int idx) {
@@ -2678,6 +2845,19 @@ static void executeCommand(const char *cmd) {
   }
 }
 
+static void updateDiagPanelVisibilityForCurrentBuffer(void) {
+  if (S.ntabs == 0) {
+    S.show_diag_panel = 0;
+    return;
+  }
+  EBuffer *b = curBuf();
+  if (!b || !b->filename || !b->syntax || !lsp_cmd_for_syntax(b->syntax->name)) {
+    S.show_diag_panel = 0;
+  } else {
+    S.show_diag_panel = 1;
+  }
+}
+
 /* ================================== layout ===================================
  */
 static void computeLayout(void) {
@@ -2726,9 +2906,9 @@ static void computeLayout(void) {
   /* Diagnostics panel: carve space out of the bottom of the editor area */
   S.diag_panel_actual_h = 0;
   S.diag_panel_y        = S.editor_y + S.editor_h; /* off-screen by default */
-  if (S.show_diag_panel && S.editor_h > 6) {
+  if (S.show_diag_panel && S.editor_h > 4) {
     int ph = S.diag_panel_h < 2 ? 2 : S.diag_panel_h;
-    int maxph = S.editor_h / 3; /* never more than a third of editor */
+    int maxph = S.editor_h / 2; /* allow up to half of editor space */
     if (maxph < 2) maxph = 2;
     if (ph > maxph) ph = maxph;
     S.diag_panel_actual_h = ph;
@@ -3427,19 +3607,13 @@ static void drawDiagPanel(abuf *ab) {
   int nwarn = b ? b->lsp.diag_warning_count  : 0;
   int ntotal = b ? b->lsp.diag_count          : 0;
 
-  RGB hbg = THEME_TOPBAR_BG[S.theme];
   RGB bg  = THEME_DIALOG_BG[S.theme];
   RGB fg  = THEME_EDITOR_FG[S.theme];
 
-  /* ---- Header row ---- */
+  /* ---- Header row: Distinctive Blue Accent bar (THEME_ACCENT) ---- */
   abGoto(ab, panelY, panelX);
-  if (S.drag_type == 3) {
-    abBg(ab, THEME_ACCENT[S.theme]);
-    abFg(ab, THEME_TOPBAR_BG[S.theme]);
-  } else {
-    abBg(ab, hbg);
-    abFg(ab, THEME_STATUSBAR_FG[S.theme]);
-  }
+  abBg(ab, THEME_ACCENT[S.theme]);
+  abFg(ab, (RGB){255, 255, 255});
 
   char hdr[128] = "";
   /* Server name */
@@ -3459,25 +3633,26 @@ static void drawDiagPanel(abuf *ab) {
 
   /* Error / warning counts */
   if (nerr > 0) {
-    abFg(ab, (RGB){255, 90, 90});
+    abFg(ab, (RGB){255, 120, 120});
     char ec[16]; snprintf(ec, sizeof(ec), "x%d ", nerr);
     abAppendStr(ab, ec); used += (int)strlen(ec);
   }
   if (nwarn > 0) {
-    abFg(ab, (RGB){255, 210, 60});
+    abFg(ab, (RGB){255, 230, 100});
     char wc[16]; snprintf(wc, sizeof(wc), "!%d ", nwarn);
     abAppendStr(ab, wc); used += (int)strlen(wc);
   }
   if (nerr == 0 && nwarn == 0 && b && b->lsp.initialized) {
-    abFg(ab, (RGB){80, 210, 80});
+    abFg(ab, (RGB){140, 255, 140});
     abAppendStr(ab, "OK "); used += 3;
   }
 
   /* Right-hand hint */
-  abFg(ab, (RGB){140, 140, 140});
-  const char *hint = " Ctrl+L: close";
+  abFg(ab, (RGB){230, 230, 255});
+  const char *hint = " \xe2\x87\x95 Drag to resize | Ctrl+L: close";
   int hlen = (int)strlen(hint);
   int pad = panelW - used - hlen;
+  if (pad < 0) pad = 0;
   for (int i = 0; i < pad; i++) abAppendStr(ab, " ");
   abAppendStr(ab, hint);
   abReset(ab);
@@ -3680,6 +3855,31 @@ static int readInputEvent(InputEvent *ev) {
       ev->key = 0;
       return 1;
     }
+    if (slen >= 2 && seq[1] == 'M') {
+      /* Basic / X10 256-coordinate mouse mode: ESC [ M b x y */
+      while (slen < 4) {
+        unsigned char nc;
+        if (readRawByte(&nc)) {
+          seq[slen++] = nc;
+        } else {
+          struct timespec ts = {0, 1000000};
+          nanosleep(&ts, NULL);
+          if (readRawByte(&nc)) seq[slen++] = nc;
+          else break;
+        }
+      }
+      if (slen >= 4) {
+        int b = (unsigned char)seq[2] - 32;
+        int x = (unsigned char)seq[3] - 32;
+        int y = (unsigned char)seq[4] - 32;
+        ev->key = KEY_MOUSE;
+        ev->mbutton = b;
+        ev->mx = x - 1;
+        ev->my = y - 1;
+        ev->mrelease = ((b & 3) == 3);
+        return 1;
+      }
+    }
     if (slen == 2) {
       switch (seq[1]) {
       case 'A':
@@ -3694,6 +3894,9 @@ static int readInputEvent(InputEvent *ev) {
       case 'D':
         ev->key = KEY_ARROW_LEFT;
         return 1;
+      case 'Z':
+        ev->key = KEY_SHIFT_TAB;
+        return 1;
       case 'H':
         ev->key = KEY_HOME;
         return 1;
@@ -3702,25 +3905,21 @@ static int readInputEvent(InputEvent *ev) {
         return 1;
       }
     }
-    /* Ctrl+Arrow: ESC [ 1 ; 5 (A-D)   Also plain PgUp/PgDn/Del/Home/End with ~
-     */
-    if (slen >= 4 && seq[0] == '1' && seq[1] == ';' && seq[2] == '5') {
+    /* Modifier + Arrow: ESC [ 1 ; <mod> (A-D)  mod: 2=Shift, 5=Ctrl */
+    if (slen >= 4 && seq[0] == '1' && seq[1] == ';') {
+      char mod = seq[2];
       char f = seq[3];
-      if (f == 'C') {
-        ev->key = KEY_CTRL_RIGHT;
-        return 1;
+      if (mod == '2') { /* Shift */
+        if (f == 'A') { ev->key = KEY_SHIFT_UP; return 1; }
+        if (f == 'B') { ev->key = KEY_SHIFT_DOWN; return 1; }
+        if (f == 'C') { ev->key = KEY_SHIFT_RIGHT; return 1; }
+        if (f == 'D') { ev->key = KEY_SHIFT_LEFT; return 1; }
       }
-      if (f == 'D') {
-        ev->key = KEY_CTRL_LEFT;
-        return 1;
-      }
-      if (f == 'A') {
-        ev->key = KEY_ARROW_UP;
-        return 1;
-      }
-      if (f == 'B') {
-        ev->key = KEY_ARROW_DOWN;
-        return 1;
+      if (mod == '5') { /* Ctrl */
+        if (f == 'A') { ev->key = KEY_CTRL_UP; return 1; }
+        if (f == 'B') { ev->key = KEY_CTRL_DOWN; return 1; }
+        if (f == 'C') { ev->key = KEY_CTRL_RIGHT; return 1; }
+        if (f == 'D') { ev->key = KEY_CTRL_LEFT; return 1; }
       }
     }
     if (seq[slen - 1] == '~') {
@@ -3881,6 +4080,11 @@ static void handleEditorKey(EBuffer *b, InputEvent *ev) {
       editorInsertChar(b, ' ');
     return;
   }
+  if (key == KEY_SHIFT_TAB) {
+    if (b->numrows == 0) return;
+    editorUnindentLine(b);
+    return;
+  }
   if (key == '(') {
     editorInsertChar(b, '(');
     editorInsertChar(b, ')');
@@ -3916,6 +4120,7 @@ static void handleEditorKey(EBuffer *b, InputEvent *ev) {
       moveCursor(b, KEY_ARROW_RIGHT);
       return;
     }
+    autoUnindentClosingBracket(b, (char)key);
     editorInsertChar(b, key);
     return;
   }
@@ -3948,8 +4153,9 @@ static void handleMouseClick(InputEvent *ev) {
   if (mx < 0) mx = 0;
   if (my < 0) my = 0;
 
-  /* ---- Mouse drag motion (left button held + moved, mbutton bit 5 set) ---- */
-  if ((ev->mbutton & ~3) == 32 && !ev->mrelease) {
+  /* ---- Mouse drag motion (left button held + moved, mbutton bit 5 set or active drag) ---- */
+  int is_drag_motion = ((ev->mbutton & 32) != 0) || (S.drag_type != 0);
+  if (is_drag_motion && !ev->mrelease) {
     if (S.drag_type == 1) { /* explorer width */
       int nw = mx;
       if (nw < EXPLORER_MIN_W) nw = EXPLORER_MIN_W;
@@ -4071,6 +4277,7 @@ static void handleMouseClick(InputEvent *ev) {
       if (mx >= col && mx < col + llen) {
         S.curtab = i;
         S.focus = FOCUS_EDITOR;
+        updateDiagPanelVisibilityForCurrentBuffer();
         return;
       }
       col += llen;
@@ -4186,12 +4393,102 @@ static int globalKeyHandled(int key) {
                       ACT_REPLACE_QUERY, 0);
     return 1;
   case KEY_CTRL_RIGHT:
-    if (S.ntabs > 0)
+    if (S.ntabs > 0) {
       S.curtab = (S.curtab + 1) % S.ntabs;
+      updateDiagPanelVisibilityForCurrentBuffer();
+    }
     return 1;
   case KEY_CTRL_LEFT:
-    if (S.ntabs > 0)
+    if (S.ntabs > 0) {
       S.curtab = (S.curtab - 1 + S.ntabs) % S.ntabs;
+      updateDiagPanelVisibilityForCurrentBuffer();
+    }
+    return 1;
+  case KEY_SHIFT_LEFT:
+    if (S.show_explorer) {
+      int nw = S.explorer_width - 2;
+      if (nw < EXPLORER_MIN_W) nw = EXPLORER_MIN_W;
+      S.explorer_user_w = nw;
+      computeLayout();
+    }
+    return 1;
+  case KEY_SHIFT_RIGHT:
+    if (S.show_explorer) {
+      int nw = S.explorer_width + 2;
+      if (nw > S.screencols / 2) nw = S.screencols / 2;
+      S.explorer_user_w = nw;
+      computeLayout();
+    }
+    return 1;
+  case KEY_SHIFT_UP:
+    if (S.show_terminal) {
+      int nh = S.terminal_height + 1;
+      if (nh > S.screenrows / 2) nh = S.screenrows / 2;
+      S.terminal_height = nh;
+      computeLayout();
+    }
+    return 1;
+  case KEY_SHIFT_DOWN:
+    if (S.show_terminal) {
+      int nh = S.terminal_height - 1;
+      if (nh < TERM_MIN_H) nh = TERM_MIN_H;
+      S.terminal_height = nh;
+      computeLayout();
+    }
+    return 1;
+  case CTRL_KEY('d'):
+  case KEY_CTRL_UP:
+    if (S.show_diag_panel) {
+      int nh = S.diag_panel_h + 1;
+      if (nh > S.screenrows / 2) nh = S.screenrows / 2;
+      S.diag_panel_h = nh;
+      computeLayout();
+      return 1;
+    }
+    return 0;
+  case CTRL_KEY('c'):
+  case KEY_CTRL_DOWN:
+    if (S.show_diag_panel) {
+      int nh = S.diag_panel_h - 1;
+      if (nh < 2) nh = 2;
+      S.diag_panel_h = nh;
+      computeLayout();
+      return 1;
+    }
+    return 0;
+  case CTRL_KEY('u'):
+    if (S.show_terminal) {
+      int nh = S.terminal_height + 1;
+      if (nh > S.screenrows / 2) nh = S.screenrows / 2;
+      S.terminal_height = nh;
+      computeLayout();
+      return 1;
+    }
+    return 0;
+  case CTRL_KEY('j'):
+    if (S.show_terminal) {
+      int nh = S.terminal_height - 1;
+      if (nh < TERM_MIN_H) nh = TERM_MIN_H;
+      S.terminal_height = nh;
+      computeLayout();
+      return 1;
+    }
+    return 0;
+  case KEY_CTRL_COMMA:
+    if (S.show_explorer) {
+      int nw = S.explorer_width - 2;
+      if (nw < EXPLORER_MIN_W) nw = EXPLORER_MIN_W;
+      S.explorer_user_w = nw;
+      computeLayout();
+    }
+    return 1;
+  case KEY_CTRL_PERIOD:
+    if (S.show_explorer) {
+      int nw = S.explorer_width + 2;
+      if (nw > S.screencols / 2) nw = S.screencols / 2;
+      S.explorer_user_w = nw;
+      computeLayout();
+    }
     return 1;
   case CTRL_KEY('l'):
     S.show_diag_panel = !S.show_diag_panel;
@@ -4466,7 +4763,7 @@ int main(int argc, char **argv) {
     newUnnamedTab();
 
   termStartShell(&S.term, S.term_h > 2 ? S.term_h - 2 : 10, S.screencols - 2);
-  computeLayout();
+  updateDiagPanelVisibilityForCurrentBuffer();
 
   setStatus("ved %s  --  Ctrl+P: commands | Ctrl+F: find | Ctrl+H: replace | Ctrl+G: goto",
             VED_VERSION);
